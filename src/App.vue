@@ -29,6 +29,19 @@
           <div class="current-time-label">北京时间</div>
           <div class="current-time-value time-display">{{ beijingTime }}</div>
         </div>
+        <button
+          type="button"
+          class="theme-toggle"
+          @click="toggleTheme"
+          :aria-label="isDark ? '当前夜间模式，切换到白天模式' : '当前白天模式，切换到夜间模式'"
+          :title="isDark ? '切换白天模式' : '切换夜间模式'"
+        >
+          <span class="theme-icon" aria-hidden="true">{{ isDark ? '🌙' : '☀️' }}</span>
+          <span class="theme-copy">
+            <span class="theme-kicker">显示模式</span>
+            <span class="theme-label">{{ isDark ? '夜间' : '白天' }}</span>
+          </span>
+        </button>
       </div>
     </aside>
 
@@ -46,6 +59,27 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted } from 'vue'
 import { RouterLink, RouterView } from 'vue-router'
+
+// Theme
+type ThemeMode = 'dark' | 'light'
+
+const THEME_STORAGE_KEY = 'clock-theme'
+
+function getInitialTheme(): ThemeMode {
+  return localStorage.getItem(THEME_STORAGE_KEY) === 'light' ? 'light' : 'dark'
+}
+
+const isDark = ref(getInitialTheme() === 'dark')
+
+function applyTheme(theme: ThemeMode) {
+  isDark.value = theme === 'dark'
+  document.documentElement.setAttribute('data-theme', theme)
+  localStorage.setItem(THEME_STORAGE_KEY, theme)
+}
+
+function toggleTheme() {
+  applyTheme(isDark.value ? 'light' : 'dark')
+}
 
 const navItems = [
   { path: '/world-clock', icon: '🌍', label: '世界时钟', sub: 'World Clock' },
@@ -189,6 +223,10 @@ onUnmounted(() => clearInterval(timer))
   border-top: 1px solid var(--border);
 }
 
+.current-time {
+  margin-bottom: 14px;
+}
+
 .current-time-label {
   font-size: 10px;
   color: var(--text-muted);
@@ -202,6 +240,67 @@ onUnmounted(() => clearInterval(timer))
   font-weight: 600;
   color: var(--accent-light);
   letter-spacing: 0.02em;
+}
+
+.theme-toggle {
+  width: 100%;
+  min-height: 48px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  background: var(--bg-card);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+  font-family: 'Space Grotesk', sans-serif;
+  text-align: left;
+  transition: background-color 0.15s, border-color 0.15s, box-shadow 0.15s, color 0.15s;
+}
+
+.theme-toggle:hover {
+  background: var(--bg-card-hover);
+  border-color: var(--border-bright);
+}
+
+.theme-toggle:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-glow);
+}
+
+.theme-icon {
+  width: 30px;
+  height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  background: var(--accent-glow);
+  color: var(--accent-light);
+  font-size: 15px;
+  flex-shrink: 0;
+}
+
+.theme-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.theme-kicker {
+  font-size: 10px;
+  color: var(--text-muted);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.theme-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
 }
 
 .main-content {
