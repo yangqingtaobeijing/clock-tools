@@ -180,13 +180,20 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onUnmounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 
 type State = 'idle' | 'running' | 'paused' | 'done'
+interface StoredCountdown {
+  state: 'running' | 'paused'
+  totalSet: number
+  remaining: number
+  endAtMs: number | null
+}
 
 const inputHours = ref(0)
 const inputMinutes = ref(25)
 const inputSeconds = ref(0)
+const COUNTDOWN_STORAGE_KEY = 'clock-countdown-state'
 
 const presets = [
   { label: '5 min', seconds: 300 },
@@ -203,6 +210,7 @@ const showDoneAlert = ref(false)
 let timer: ReturnType<typeof setInterval> | null = null
 let ringTimer: ReturnType<typeof setInterval> | null = null
 let audioCtx: AudioContext | null = null
+let endAtMs: number | null = null
 
 const supportsNotification = 'Notification' in window
 const notifPermission = ref(supportsNotification ? Notification.permission : 'denied')
@@ -265,23 +273,36 @@ function start() {
   remaining.value = totalSeconds.value
   showDoneAlert.value = false
   state.value = 'running'
+  endAtMs = Date.now() + totalSeconds.value * 1000
   prepareAudio()
+  saveCountdownState()
   startTick()
 }
 
 function pause() {
+  syncRemaining()
   state.value = 'paused'
   stopTick()
+  endAtMs = null
+  saveCountdownState()
 }
 
 function resume() {
+  if (remaining.value <= 0) {
+    finishCountdown()
+    return
+  }
   state.value = 'running'
+  endAtMs = Date.now() + remaining.value * 1000
+  saveCountdownState()
   startTick()
 }
 
 function reset() {
   stopTick()
   stopRinging()
+  endAtMs = null
+  clearCountdownState()
   state.value = 'idle'
   remaining.value = 0
   totalSet.value = 0
@@ -290,15 +311,23 @@ function reset() {
 
 function startTick() {
   stopTick()
-  timer = setInterval(() => {
-    remaining.value = Math.max(remaining.value - 1, 0)
-    if (remaining.value === 0) finishCountdown()
-  }, 1000)
+  syncRemaining()
+  timer = setInterval(syncRemaining, 1000)
+}
+
+function syncRemaining() {
+  if (state.value !== 'running' || endAtMs === null) return
+  const secondsLeft = Math.max(0, Math.ceil((endAtMs - Date.now()) / 1000))
+  remaining.value = secondsLeft
+  if (secondsLeft === 0) finishCountdown()
 }
 
 function finishCountdown() {
   stopTick()
   if (state.value === 'done') return
+  endAtMs = null
+  remaining.value = 0
+  clearCountdownState()
   state.value = 'done'
   showDoneAlert.value = true
   onDone()
@@ -348,6 +377,57 @@ function dismissDoneAlert() {
   showDoneAlert.value = false
 }
 
+function saveCountdownState() {
+  if (state.value !== 'running' && state.value !== 'paused') return
+  const payload: StoredCountdown = {
+    state: state.value,
+    totalSet: totalSet.value,
+    remaining: remaining.value,
+    endAtMs,
+  }
+  localStorage.setItem(COUNTDOWN_STORAGE_KEY, JSON.stringify(payload))
+}
+
+function clearCountdownState() {
+  localStorage.removeItem(COUNTDOWN_STORAGE_KEY)
+}
+
+function restoreCountdownState() {
+  try {
+    const raw = localStorage.getItem(COUNTDOWN_STORAGE_KEY)
+    if (!raw) return
+    const stored = JSON.parse(raw) as StoredCountdown
+    if (!stored.totalSet || stored.totalSet <= 0) {
+      clearCountdownState()
+      return
+    }
+
+    totalSet.value = stored.totalSet
+    if (stored.state === 'paused') {
+      state.value = 'paused'
+      remaining.value = Math.max(0, stored.remaining || 0)
+      if (remaining.value === 0) clearCountdownState()
+      return
+    }
+
+    if (!stored.endAtMs) {
+      clearCountdownState()
+      return
+    }
+
+    endAtMs = stored.endAtMs
+    remaining.value = Math.max(0, Math.ceil((endAtMs - Date.now()) / 1000))
+    state.value = 'running'
+    if (remaining.value === 0) {
+      finishCountdown()
+    } else {
+      startTick()
+    }
+  } catch (e) {
+    clearCountdownState()
+  }
+}
+
 function playBeep() {
   try {
     prepareAudio()
@@ -376,9 +456,21 @@ async function requestNotification() {
   notifPermission.value = perm
 }
 
+function handleTimerResume() {
+  syncRemaining()
+}
+
+onMounted(() => {
+  restoreCountdownState()
+  document.addEventListener('visibilitychange', handleTimerResume)
+  window.addEventListener('focus', handleTimerResume)
+})
+
 onUnmounted(() => {
   stopTick()
   stopRinging()
+  document.removeEventListener('visibilitychange', handleTimerResume)
+  window.removeEventListener('focus', handleTimerResume)
   if (audioCtx) audioCtx.close()
 })
 </script>
