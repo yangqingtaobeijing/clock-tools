@@ -86,6 +86,7 @@
                 <span class="pulse-dot"></span>
                 响铃中
               </div>
+              <button v-if="alarm.ringing" class="btn btn-red btn-stop" @click="stopAlarm(alarm.id)">停止</button>
               <label class="toggle">
                 <input type="checkbox" :checked="alarm.active" @change="toggleAlarm(alarm.id)" />
                 <span class="toggle-slider"></span>
@@ -98,7 +99,12 @@
     </div>
 
     <!-- Notification permission -->
-    <div class="notif-bar card" v-if="notifPermission !== 'granted'" style="margin-top: 20px;">
+    <div class="notif-bar card" v-if="!supportsNotification" style="margin-top: 20px;">
+      <span class="notif-icon">🔕</span>
+      <span class="notif-text">系统通知不可用，闹钟到时仍会显示页面提醒 + 声音提醒</span>
+    </div>
+
+    <div class="notif-bar card" v-else-if="notifPermission !== 'granted'" style="margin-top: 20px;">
       <span class="notif-icon">🔔</span>
       <span class="notif-text">开启浏览器通知，闹钟到时将弹出提醒</span>
       <button class="btn btn-primary" @click="requestNotification">授权通知</button>
@@ -108,6 +114,21 @@
     <div class="current-time-display">
       <span class="time-display">{{ currentBeijingTime }}</span>
       <span class="ct-label">北京时间</span>
+    </div>
+
+    <div v-if="ringingAlarm" class="alarm-overlay" role="alertdialog" aria-modal="true" aria-labelledby="alarm-alert-title">
+      <div class="alarm-dialog card">
+        <div class="alarm-alert-icon">🔔</div>
+        <div class="alarm-alert-content">
+          <h2 id="alarm-alert-title" class="alarm-alert-title">闹钟时间到</h2>
+          <p class="alarm-alert-time time-display">{{ ringingAlarm.time }}</p>
+          <p class="alarm-alert-desc">{{ getAlarmLabel(ringingAlarm) }}</p>
+        </div>
+        <div class="alarm-alert-actions">
+          <button class="btn btn-red btn-lg" @click="stopAlarm(ringingAlarm.id)">停止提醒</button>
+          <button class="btn btn-ghost btn-lg" @click="dismissAlarmAlert">仅关闭弹窗</button>
+        </div>
+      </div>
     </div>
   </div>
 </template>
@@ -127,14 +148,23 @@ interface Alarm {
 const newAlarmTime = ref('21:30')
 const newAlarmLabel = ref('美股开盘')
 const newAlarmNote = ref('')
-const notifPermission = ref(Notification.permission)
+const supportsNotification = 'Notification' in window
+const notifPermission = ref(supportsNotification ? Notification.permission : 'denied')
+const notificationIcon = `${import.meta.env.BASE_URL}favicon.svg`
+const ringingAlarm = ref<Alarm | null>(null)
 
 const alarms = ref<Alarm[]>(
-  JSON.parse(localStorage.getItem('clock-alarms') || '[]')
+  JSON.parse(localStorage.getItem('clock-alarms') || '[]').map((alarm: Alarm) => ({
+    ...alarm,
+    ringing: false,
+  }))
 )
 
 const now = ref(new Date())
 let checkTimer: ReturnType<typeof setInterval>
+let ringTimer: ReturnType<typeof setInterval> | null = null
+let audioCtx: AudioContext | null = null
+const triggeredAlarmKeys = new Set<string>()
 
 const currentBeijingTime = computed(() => {
   return new Intl.DateTimeFormat('en-GB', {
@@ -154,6 +184,10 @@ function getLabelEmoji(label: string) {
   if (label === '美股开盘') return ''
   if (label === '美股收盘') return ''
   return ''
+}
+
+function getAlarmLabel(alarm: Alarm) {
+  return alarm.label === '自定义' && alarm.note ? alarm.note : alarm.label
 }
 
 function getAlarmCountdown(time: string) {
@@ -196,6 +230,7 @@ function addAlarm() {
 }
 
 function removeAlarm(id: string) {
+  stopAlarm(id)
   alarms.value = alarms.value.filter(a => a.id !== id)
   saveAlarms()
 }
@@ -203,6 +238,7 @@ function removeAlarm(id: string) {
 function toggleAlarm(id: string) {
   const alarm = alarms.value.find(a => a.id === id)
   if (alarm) {
+    if (alarm.ringing) stopAlarm(id)
     alarm.active = !alarm.active
     alarm.ringing = false
     saveAlarms()
@@ -219,57 +255,120 @@ function checkAlarms() {
     hour: '2-digit',
     minute: '2-digit',
     second: '2-digit',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
     hour12: false,
   }).formatToParts(now.value)
   const h = parseInt(bjParts.find(p => p.type === 'hour')!.value)
   const m = parseInt(bjParts.find(p => p.type === 'minute')!.value)
   const s = parseInt(bjParts.find(p => p.type === 'second')!.value)
+  const y = bjParts.find(p => p.type === 'year')!.value
+  const mo = bjParts.find(p => p.type === 'month')!.value
+  const d = bjParts.find(p => p.type === 'day')!.value
 
   const timeStr = `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`
+  const dateKey = `${y}-${mo}-${d}`
 
   alarms.value.forEach(alarm => {
-    if (alarm.active && !alarm.ringing && alarm.time === timeStr && s < 5) {
+    const triggerKey = `${alarm.id}-${dateKey}-${timeStr}`
+    if (
+      alarm.active &&
+      !alarm.ringing &&
+      alarm.time === timeStr &&
+      s < 5 &&
+      !triggeredAlarmKeys.has(triggerKey)
+    ) {
+      triggeredAlarmKeys.add(triggerKey)
       alarm.ringing = true
       triggerAlarm(alarm)
-      setTimeout(() => {
-        alarm.ringing = false
-      }, 60000)
+      saveAlarms()
     }
   })
 }
 
 function triggerAlarm(alarm: Alarm) {
-  playBeep()
-  if (Notification.permission === 'granted') {
-    const label = alarm.label === '自定义' && alarm.note ? alarm.note : alarm.label
+  ringingAlarm.value = alarm
+  startRinging()
+  if (supportsNotification && Notification.permission === 'granted') {
+    const label = getAlarmLabel(alarm)
     new Notification(`🔔 闹钟 - ${label}`, {
-      body: `时间：${alarm.time}`,
-      icon: '/clock-tools/favicon.ico',
+      body: `时间：${alarm.time}，请回到页面停止提醒。`,
+      icon: notificationIcon,
     })
+  }
+}
+
+function stopAlarm(id?: string) {
+  if (!id && !ringingAlarm.value) {
+    alarms.value.forEach(alarm => { alarm.ringing = false })
+    stopRinging()
+    saveAlarms()
+    return
+  }
+
+  const targetId = id || ringingAlarm.value?.id
+  const alarm = alarms.value.find(a => a.id === targetId)
+  if (alarm) alarm.ringing = false
+
+  const nextRingingAlarm = alarms.value.find(a => a.ringing)
+  if (nextRingingAlarm) {
+    ringingAlarm.value = nextRingingAlarm
+  } else {
+    ringingAlarm.value = null
+    stopRinging()
+  }
+  saveAlarms()
+}
+
+function dismissAlarmAlert() {
+  ringingAlarm.value = null
+}
+
+function prepareAudio() {
+  try {
+    audioCtx = audioCtx || new AudioContext()
+    if (audioCtx.state === 'suspended') audioCtx.resume()
+  } catch (e) {
+    audioCtx = null
+  }
+}
+
+function startRinging() {
+  stopRinging()
+  playBeep()
+  ringTimer = setInterval(playBeep, 1200)
+}
+
+function stopRinging() {
+  if (ringTimer) {
+    clearInterval(ringTimer)
+    ringTimer = null
   }
 }
 
 function playBeep() {
   try {
-    const ctx = new AudioContext()
-    for (let i = 0; i < 3; i++) {
-      setTimeout(() => {
-        const osc = ctx.createOscillator()
-        const gain = ctx.createGain()
-        osc.connect(gain)
-        gain.connect(ctx.destination)
-        osc.frequency.value = 660
-        osc.type = 'square'
-        gain.gain.setValueAtTime(0.3, ctx.currentTime)
-        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.3)
-        osc.start(ctx.currentTime)
-        osc.stop(ctx.currentTime + 0.3)
-      }, i * 400)
+    prepareAudio()
+    if (!audioCtx) return
+    for (let i = 0; i < 2; i++) {
+      const startAt = audioCtx.currentTime + i * 0.28
+      const osc = audioCtx.createOscillator()
+      const gain = audioCtx.createGain()
+      osc.connect(gain)
+      gain.connect(audioCtx.destination)
+      osc.frequency.value = 660
+      osc.type = 'square'
+      gain.gain.setValueAtTime(0.35, startAt)
+      gain.gain.exponentialRampToValueAtTime(0.001, startAt + 0.22)
+      osc.start(startAt)
+      osc.stop(startAt + 0.22)
     }
   } catch (e) {}
 }
 
 async function requestNotification() {
+  if (!supportsNotification) return
   const perm = await Notification.requestPermission()
   notifPermission.value = perm
 }
@@ -281,7 +380,11 @@ onMounted(() => {
   }, 1000)
 })
 
-onUnmounted(() => clearInterval(checkTimer))
+onUnmounted(() => {
+  clearInterval(checkTimer)
+  stopRinging()
+  if (audioCtx) audioCtx.close()
+})
 </script>
 
 <style scoped>
@@ -436,6 +539,11 @@ onUnmounted(() => clearInterval(checkTimer))
   font-weight: 600;
 }
 
+.btn-stop {
+  padding: 6px 10px;
+  font-size: 12px;
+}
+
 /* Toggle switch */
 .toggle {
   position: relative;
@@ -517,5 +625,72 @@ onUnmounted(() => clearInterval(checkTimer))
   color: var(--text-muted);
   letter-spacing: 0.05em;
   text-transform: uppercase;
+}
+
+/* Alarm alert */
+.alarm-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(0, 0, 0, 0.5);
+}
+
+.alarm-dialog {
+  width: min(420px, 100%);
+  padding: 28px;
+  text-align: center;
+  border-color: rgba(245, 158, 11, 0.4);
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.32);
+}
+
+.alarm-alert-icon {
+  width: 56px;
+  height: 56px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 16px;
+  border-radius: 8px;
+  background: var(--amber-glow);
+  color: var(--amber);
+  font-size: 28px;
+  animation: alarmPulse 0.8s ease-in-out infinite alternate;
+}
+
+.alarm-alert-title {
+  font-size: 24px;
+  font-weight: 700;
+  color: var(--text-primary);
+  margin-bottom: 8px;
+}
+
+.alarm-alert-time {
+  font-size: 48px;
+  font-weight: 700;
+  color: var(--amber);
+  line-height: 1;
+  margin-bottom: 10px;
+}
+
+.alarm-alert-desc {
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+  margin-bottom: 24px;
+}
+
+.alarm-alert-actions {
+  display: flex;
+  justify-content: center;
+  gap: 10px;
+}
+
+@keyframes alarmPulse {
+  from { transform: scale(1) rotate(-5deg); }
+  to { transform: scale(1.08) rotate(5deg); }
 }
 </style>

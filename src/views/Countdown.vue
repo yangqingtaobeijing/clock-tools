@@ -63,6 +63,7 @@
             <button class="btn btn-ghost btn-lg" @click="reset">↺ 重置</button>
           </template>
           <template v-else-if="state === 'done'">
+            <button v-if="showDoneAlert" class="btn btn-red btn-lg" @click="dismissDoneAlert">停止提醒</button>
             <button class="btn btn-primary btn-lg" @click="reset">↺ 重新开始</button>
           </template>
         </div>
@@ -133,7 +134,15 @@
         </div>
 
         <!-- Notification permission -->
-        <div class="card panel notification-panel" v-if="notifPermission !== 'granted'">
+        <div class="card panel notification-panel" v-if="!supportsNotification">
+          <div class="notif-icon">🔕</div>
+          <div class="notif-text">
+            <div class="notif-title">系统通知不可用</div>
+            <div class="notif-desc">倒计时结束时仍会显示页面提醒 + 声音提醒</div>
+          </div>
+        </div>
+
+        <div class="card panel notification-panel" v-else-if="notifPermission !== 'granted'">
           <div class="notif-icon">🔔</div>
           <div class="notif-text">
             <div class="notif-title">开启通知提醒</div>
@@ -150,6 +159,20 @@
             <div class="notif-title">通知已开启</div>
             <div class="notif-desc">倒计时结束时将发送浏览器通知 + 声音提醒</div>
           </div>
+        </div>
+      </div>
+    </div>
+
+    <div v-if="showDoneAlert" class="done-overlay" role="alertdialog" aria-modal="true" aria-labelledby="done-title">
+      <div class="done-dialog card">
+        <div class="done-icon">⏰</div>
+        <div class="done-content">
+          <h2 id="done-title" class="done-title">倒计时结束</h2>
+          <p class="done-desc">设定的 {{ formatDuration(totalSet) }} 已完成，请停止提醒后继续。</p>
+        </div>
+        <div class="done-actions">
+          <button class="btn btn-red btn-lg" @click="dismissDoneAlert">停止提醒</button>
+          <button class="btn btn-ghost btn-lg" @click="reset">重新开始</button>
         </div>
       </div>
     </div>
@@ -176,9 +199,14 @@ const presets = [
 const state = ref<State>('idle')
 const remaining = ref(0)
 const totalSet = ref(0)
+const showDoneAlert = ref(false)
 let timer: ReturnType<typeof setInterval> | null = null
+let ringTimer: ReturnType<typeof setInterval> | null = null
+let audioCtx: AudioContext | null = null
 
-const notifPermission = ref(Notification.permission)
+const supportsNotification = 'Notification' in window
+const notifPermission = ref(supportsNotification ? Notification.permission : 'denied')
+const notificationIcon = `${import.meta.env.BASE_URL}favicon.svg`
 
 const totalSeconds = computed(() =>
   (inputHours.value || 0) * 3600 + (inputMinutes.value || 0) * 60 + (inputSeconds.value || 0)
@@ -222,11 +250,22 @@ function pad(n: number) {
   return String(n).padStart(2, '0')
 }
 
+function formatDuration(seconds: number) {
+  const h = Math.floor(seconds / 3600)
+  const m = Math.floor((seconds % 3600) / 60)
+  const s = seconds % 60
+  if (h > 0) return `${h}小时${m}分${s}秒`
+  if (m > 0) return `${m}分${s}秒`
+  return `${s}秒`
+}
+
 function start() {
   if (totalSeconds.value === 0) return
   totalSet.value = totalSeconds.value
   remaining.value = totalSeconds.value
+  showDoneAlert.value = false
   state.value = 'running'
+  prepareAudio()
   startTick()
 }
 
@@ -242,21 +281,27 @@ function resume() {
 
 function reset() {
   stopTick()
+  stopRinging()
   state.value = 'idle'
   remaining.value = 0
   totalSet.value = 0
+  showDoneAlert.value = false
 }
 
 function startTick() {
+  stopTick()
   timer = setInterval(() => {
-    if (remaining.value <= 0) {
-      stopTick()
-      state.value = 'done'
-      onDone()
-      return
-    }
-    remaining.value--
+    remaining.value = Math.max(remaining.value - 1, 0)
+    if (remaining.value === 0) finishCountdown()
   }, 1000)
+}
+
+function finishCountdown() {
+  stopTick()
+  if (state.value === 'done') return
+  state.value = 'done'
+  showDoneAlert.value = true
+  onDone()
 }
 
 function stopTick() {
@@ -267,39 +312,75 @@ function stopTick() {
 }
 
 function onDone() {
-  playBeep()
-  if (Notification.permission === 'granted') {
+  startRinging()
+  if (supportsNotification && Notification.permission === 'granted') {
     new Notification('⏰ 倒计时结束！', {
-      body: `${displayTime.value} 时间到！`,
-      icon: '/clock-tools/favicon.ico',
+      body: `${formatDuration(totalSet.value)} 时间到，请回到页面停止提醒。`,
+      icon: notificationIcon,
     })
   }
 }
 
+function prepareAudio() {
+  try {
+    audioCtx = audioCtx || new AudioContext()
+    if (audioCtx.state === 'suspended') audioCtx.resume()
+  } catch (e) {
+    audioCtx = null
+  }
+}
+
+function startRinging() {
+  stopRinging()
+  playBeep()
+  ringTimer = setInterval(playBeep, 1200)
+}
+
+function stopRinging() {
+  if (ringTimer) {
+    clearInterval(ringTimer)
+    ringTimer = null
+  }
+}
+
+function dismissDoneAlert() {
+  stopRinging()
+  showDoneAlert.value = false
+}
+
 function playBeep() {
   try {
-    const ctx = new AudioContext()
-    const osc = ctx.createOscillator()
-    const gain = ctx.createGain()
-    osc.connect(gain)
-    gain.connect(ctx.destination)
-    osc.frequency.value = 880
-    osc.type = 'sine'
-    gain.gain.setValueAtTime(0.5, ctx.currentTime)
-    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.8)
-    osc.start(ctx.currentTime)
-    osc.stop(ctx.currentTime + 0.8)
+    prepareAudio()
+    if (!audioCtx) return
+    for (let i = 0; i < 2; i++) {
+      const startAt = audioCtx.currentTime + i * 0.28
+      const osc = audioCtx.createOscillator()
+      const gain = audioCtx.createGain()
+      osc.connect(gain)
+      gain.connect(audioCtx.destination)
+      osc.frequency.value = 880
+      osc.type = 'square'
+      gain.gain.setValueAtTime(0.35, startAt)
+      gain.gain.exponentialRampToValueAtTime(0.001, startAt + 0.22)
+      osc.start(startAt)
+      osc.stop(startAt + 0.22)
+    }
   } catch (e) {
     // ignore AudioContext errors
   }
 }
 
 async function requestNotification() {
+  if (!supportsNotification) return
   const perm = await Notification.requestPermission()
   notifPermission.value = perm
 }
 
-onUnmounted(() => stopTick())
+onUnmounted(() => {
+  stopTick()
+  stopRinging()
+  if (audioCtx) audioCtx.close()
+})
 </script>
 
 <style scoped>
@@ -501,5 +582,64 @@ onUnmounted(() => stopTick())
   font-size: 12px;
   color: var(--text-muted);
   line-height: 1.4;
+}
+
+/* Done alert */
+.done-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(0, 0, 0, 0.5);
+}
+
+.done-dialog {
+  width: min(420px, 100%);
+  padding: 28px;
+  text-align: center;
+  border-color: rgba(239, 68, 68, 0.35);
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.32);
+}
+
+.done-icon {
+  width: 56px;
+  height: 56px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 16px;
+  border-radius: 8px;
+  background: var(--red-glow);
+  color: var(--red);
+  font-size: 28px;
+  animation: alertPulse 0.8s ease-in-out infinite alternate;
+}
+
+.done-title {
+  font-size: 24px;
+  font-weight: 700;
+  color: var(--text-primary);
+  margin-bottom: 8px;
+}
+
+.done-desc {
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+  margin-bottom: 24px;
+}
+
+.done-actions {
+  display: flex;
+  justify-content: center;
+  gap: 10px;
+}
+
+@keyframes alertPulse {
+  from { transform: scale(1); }
+  to { transform: scale(1.08); }
 }
 </style>
