@@ -164,6 +164,7 @@ const now = ref(new Date())
 let checkTimer: ReturnType<typeof setInterval>
 let ringTimer: ReturnType<typeof setInterval> | null = null
 let audioCtx: AudioContext | null = null
+let lastAlarmCheckMs = Date.now()
 const triggeredAlarmKeys = new Set<string>()
 
 const currentBeijingTime = computed(() => {
@@ -249,7 +250,7 @@ function saveAlarms() {
   localStorage.setItem('clock-alarms', JSON.stringify(alarms.value))
 }
 
-function checkAlarms() {
+function getBeijingParts(date: Date) {
   const bjParts = new Intl.DateTimeFormat('en-US', {
     timeZone: 'Asia/Shanghai',
     hour: '2-digit',
@@ -259,32 +260,59 @@ function checkAlarms() {
     month: '2-digit',
     day: '2-digit',
     hour12: false,
-  }).formatToParts(now.value)
-  const h = parseInt(bjParts.find(p => p.type === 'hour')!.value)
-  const m = parseInt(bjParts.find(p => p.type === 'minute')!.value)
-  const s = parseInt(bjParts.find(p => p.type === 'second')!.value)
-  const y = bjParts.find(p => p.type === 'year')!.value
-  const mo = bjParts.find(p => p.type === 'month')!.value
-  const d = bjParts.find(p => p.type === 'day')!.value
+  }).formatToParts(date)
+  const get = (type: string) => bjParts.find(p => p.type === type)?.value || '0'
+  return {
+    dateKey: `${get('year')}-${get('month')}-${get('day')}`,
+    minuteOfDay: Number(get('hour')) * 60 + Number(get('minute')),
+    second: Number(get('second')),
+  }
+}
 
-  const timeStr = `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`
-  const dateKey = `${y}-${mo}-${d}`
+function shouldTriggerAlarm(alarm: Alarm, previousMs: number, currentMs: number) {
+  if (!alarm.active || alarm.ringing) return null
 
-  alarms.value.forEach(alarm => {
-    const triggerKey = `${alarm.id}-${dateKey}-${timeStr}`
+  const [hStr, mStr] = alarm.time.split(':')
+  const targetMinute = Number(hStr) * 60 + Number(mStr)
+  const previous = getBeijingParts(new Date(previousMs))
+  const current = getBeijingParts(new Date(currentMs))
+  const gapMs = currentMs - previousMs
+
+  let triggerDateKey: string | null = null
+  if (previous.dateKey === current.dateKey) {
     if (
-      alarm.active &&
-      !alarm.ringing &&
-      alarm.time === timeStr &&
-      s < 5 &&
-      !triggeredAlarmKeys.has(triggerKey)
+      (targetMinute > previous.minuteOfDay && targetMinute <= current.minuteOfDay) ||
+      (targetMinute === current.minuteOfDay && current.second < 5)
     ) {
-      triggeredAlarmKeys.add(triggerKey)
-      alarm.ringing = true
-      triggerAlarm(alarm)
-      saveAlarms()
+      triggerDateKey = current.dateKey
     }
+  } else if (gapMs <= 25 * 60 * 60 * 1000) {
+    if (targetMinute > previous.minuteOfDay) {
+      triggerDateKey = previous.dateKey
+    } else if (targetMinute <= current.minuteOfDay) {
+      triggerDateKey = current.dateKey
+    }
+  } else if (targetMinute === current.minuteOfDay && current.second < 5) {
+    triggerDateKey = current.dateKey
+  }
+
+  if (!triggerDateKey) return null
+  const triggerKey = `${alarm.id}-${triggerDateKey}-${alarm.time}`
+  if (triggeredAlarmKeys.has(triggerKey)) return null
+  return triggerKey
+}
+
+function checkAlarms() {
+  const currentMs = now.value.getTime()
+  alarms.value.forEach(alarm => {
+    const triggerKey = shouldTriggerAlarm(alarm, lastAlarmCheckMs, currentMs)
+    if (!triggerKey) return
+    triggeredAlarmKeys.add(triggerKey)
+    alarm.ringing = true
+    triggerAlarm(alarm)
+    saveAlarms()
   })
+  lastAlarmCheckMs = currentMs
 }
 
 function triggerAlarm(alarm: Alarm) {
@@ -373,16 +401,25 @@ async function requestNotification() {
   notifPermission.value = perm
 }
 
+function handleAlarmResume() {
+  now.value = new Date()
+  checkAlarms()
+}
+
 onMounted(() => {
   checkTimer = setInterval(() => {
     now.value = new Date()
     checkAlarms()
   }, 1000)
+  document.addEventListener('visibilitychange', handleAlarmResume)
+  window.addEventListener('focus', handleAlarmResume)
 })
 
 onUnmounted(() => {
   clearInterval(checkTimer)
   stopRinging()
+  document.removeEventListener('visibilitychange', handleAlarmResume)
+  window.removeEventListener('focus', handleAlarmResume)
   if (audioCtx) audioCtx.close()
 })
 </script>
